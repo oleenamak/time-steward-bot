@@ -910,7 +910,7 @@ async def export_day_to_vault(date: str) -> None:
     if not vault.is_configured():
         raise RuntimeError("VAULT_REPO_SSH_URL / VAULT_DEPLOY_KEY not set")
     markdown = render_day_markdown(date)
-    relative_path = f"Time Steward/Logs/{date}.md"
+    relative_path = f"Logs/{date}.md"
     await asyncio.to_thread(vault.push_file, relative_path, markdown, f"Log for {date}")
 
 
