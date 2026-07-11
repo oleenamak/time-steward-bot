@@ -15,7 +15,13 @@ A personal Telegram bot that:
   or paused.
 - Sends a 6:00 AM good-morning ping (which also asks for today's one-thing
   intention) and hourly check-in pings (07:00-23:00) while AWAKE.
-- Auto-sleeps at 11:30 PM if still AWAKE (FR-5 hard stop).
+- At goodnight or the 11:30 PM hard stop (FR-5), generates and sends a daily
+  summary (tracked/untracked hours, a category bar chart, wins, one
+  observation) closing with a "Steward's Verdict" — a tier (1-3) picked by
+  pure rules over the day's computed facts (never by Claude) and inspired by
+  the parable of the talents, with Claude only writing the prose for the
+  tier it's given. The tier is stored with the summary for future weekly
+  rollups.
 
 Runs via long polling — no webhook, no public URL needed.
 """
@@ -49,7 +55,17 @@ TZ = ZoneInfo(os.environ.get("TZ", "America/Chicago"))
 
 DB_PATH = os.environ.get("DB_PATH", "time_steward.db")
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
+SONNET_MODEL = "claude-sonnet-5"
 INTENTS = {"checkin", "goodnight", "pause", "correction", "query", "settings", "other"}
+DAY_SIGNALS = {"sick", "rest_day"}
+
+# The tier is decided entirely by decide_tier() below (pure rules over the day's
+# computed facts) — Claude is only ever asked to write prose for a tier it is given.
+VERDICT_TIER_LABELS = {
+    1: "Well done, good and faithful servant",
+    2: "Faithful in part",
+    3: "The wicked and lazy servant",
+}
 
 # Seeded fresh into the `categories` table on every startup — see FR-11 in the PRD.
 # (name, weekly_target_hours or None, notes used to steer the categorization prompt)
@@ -74,6 +90,15 @@ logging.basicConfig(
 logger = logging.getLogger("time_steward")
 
 anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+
+def extract_response_text(response) -> str:
+    """Some models (e.g. extended-thinking Sonnet) put a ThinkingBlock before the
+    TextBlock, so content[0] isn't reliably the text — find it explicitly."""
+    for block in response.content:
+        if getattr(block, "type", None) == "text":
+            return block.text
+    raise ValueError("no text block in response")
 
 
 def init_db() -> None:
@@ -137,6 +162,7 @@ def init_db() -> None:
                 activity TEXT NOT NULL,
                 category TEXT,
                 guessed_category TEXT NOT NULL,
+                duration_min INTEGER NOT NULL,
                 confidence TEXT NOT NULL CHECK (confidence IN ('high', 'low')),
                 status TEXT NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'confirmed', 'guessed')),
@@ -144,6 +170,27 @@ def init_db() -> None:
                 resolved_at TEXT,
                 asked_at TEXT,
                 message_id INTEGER
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS day_meta (
+                date TEXT PRIMARY KEY,
+                paused_used INTEGER NOT NULL DEFAULT 0,
+                sick INTEGER NOT NULL DEFAULT 0,
+                rest_day INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL UNIQUE,
+                payload_json TEXT NOT NULL,
+                tier INTEGER NOT NULL CHECK (tier IN (1, 2, 3)),
+                sent_at TEXT NOT NULL
             )
             """
         )
@@ -216,6 +263,104 @@ def is_paused(row: sqlite3.Row) -> bool:
     return datetime.fromisoformat(row["paused_until"]) > datetime.now(TZ)
 
 
+def get_intention(date: str) -> str | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT text FROM intentions WHERE date = ?", (date,)).fetchone()
+        return row[0] if row else None
+
+
+def mark_day_flag(flag: str, date: str | None = None) -> None:
+    assert flag in ("paused_used", "sick", "rest_day")
+    day = date or datetime.now(TZ).date().isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            f"""
+            INSERT INTO day_meta (date, {flag}) VALUES (?, 1)
+            ON CONFLICT(date) DO UPDATE SET {flag} = 1
+            """,
+            (day,),
+        )
+
+
+def get_day_meta(date: str) -> dict:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM day_meta WHERE date = ?", (date,)).fetchone()
+        if row is None:
+            return {"date": date, "paused_used": 0, "sick": 0, "rest_day": 0}
+        return dict(row)
+
+
+def compute_waking_hours(end_time: datetime) -> float:
+    start = end_time.replace(hour=6, minute=0, second=0, microsecond=0)
+    if end_time <= start:
+        return 0.0
+    return (end_time - start).total_seconds() / 3600
+
+
+def compute_category_hours(entries: list[dict]) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    for e in entries:
+        cat = e["category"] or e["guessed_category"]
+        totals[cat] = totals.get(cat, 0.0) + (e["duration_min"] or 0) / 60
+    return totals
+
+
+def get_category_weekly_target(name: str) -> float | None:
+    for c in get_categories():
+        if c["name"] == name:
+            return c["weekly_target_hours"]
+    return None
+
+
+def format_hours(h: float) -> str:
+    return f"{h:.1f}h"
+
+
+def format_minutes(m: int) -> str:
+    if m < 60:
+        return f"{m}m"
+    hrs, mins = divmod(m, 60)
+    return f"{hrs}h{mins}m" if mins else f"{hrs}h"
+
+
+def build_bar_chart(category_hours: dict[str, float]) -> str:
+    if not category_hours:
+        return "(nothing logged)"
+    max_hours = max(category_hours.values()) or 1
+    lines = []
+    for name, hours in category_hours.items():
+        bar_len = round((hours / max_hours) * 10)
+        bar = "█" * bar_len + "░" * (10 - bar_len)
+        lines.append(f"{name:<13}{bar} {format_hours(hours)}")
+    return "\n".join(lines)
+
+
+def decide_tier(facts: dict) -> int:
+    """Pure rules, no LLM — this is the ONLY thing that selects the tier."""
+    if facts["rest_day"]:
+        return 1  # Sabbath clause: a well-kept rest day is faithful stewardship.
+
+    intention_ok = facts["intention_or_win_met"]
+    deep_ok = facts["deep_work_hours"] >= facts["deep_work_daily_target"]
+    untracked_low = facts["untracked_pct"] < 0.20
+
+    if intention_ok and deep_ok and untracked_low:
+        return 1
+
+    excused = facts["paused_used"] or facts["sick"]
+    deep_near_zero = facts["deep_work_hours"] < 0.25
+    if (
+        not excused
+        and facts["untracked_pct"] > 0.50
+        and not intention_ok
+        and deep_near_zero
+    ):
+        return 3
+
+    return 2
+
+
 def get_categories() -> list[dict]:
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
@@ -240,7 +385,9 @@ def append_category_note(category_name: str, note: str, max_lines: int = 10) -> 
     invalidate_classify_prompt_cache()
 
 
-def create_entry(activity: str, guessed_category: str, confidence: str, status: str) -> int:
+def create_entry(
+    activity: str, guessed_category: str, duration_min: int, confidence: str, status: str
+) -> int:
     today = datetime.now(TZ).date().isoformat()
     now = datetime.now(TZ).isoformat()
     category = guessed_category if status == "confirmed" else None
@@ -248,14 +395,16 @@ def create_entry(activity: str, guessed_category: str, confidence: str, status: 
         cur = conn.execute(
             """
             INSERT INTO entries
-                (date, activity, category, guessed_category, confidence, status, created_at, resolved_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (date, activity, category, guessed_category, duration_min, confidence, status,
+                 created_at, resolved_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 today,
                 activity,
                 category,
                 guessed_category,
+                duration_min,
                 confidence,
                 status,
                 now,
@@ -263,6 +412,18 @@ def create_entry(activity: str, guessed_category: str, confidence: str, status: 
             ),
         )
         return cur.lastrowid
+
+
+def get_entries_for_date(date: str) -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        return [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM entries WHERE date = ? AND status != 'pending' ORDER BY id",
+                (date,),
+            )
+        ]
 
 
 def get_entry(entry_id: int) -> sqlite3.Row | None:
@@ -337,44 +498,58 @@ def get_classify_system_prompt() -> str:
         "Respond with JSON only, no prose, matching exactly this schema: "
         '{"intent": "checkin|goodnight|pause|correction|query|settings|other", '
         '"pause_hours": <number or null>, '
+        '"day_signal": "sick"|"rest_day"|null, '
         '"entries": [{"activity": "<short activity phrase>", '
-        '"category": "<category name>", "confidence": "high|low"}] or null}. '
+        '"category": "<category name>", "confidence": "high|low", '
+        '"duration_min": <integer minutes>}] or null}. '
         'Use "goodnight" for sleep signals like "good night", "gn", "going to bed", '
         '"done for the day". Use "pause" when the user wants pings suppressed '
         '(e.g. "pause 2 hours", "skip today", "traveling") — set pause_hours to the '
-        "requested duration in hours if given, otherwise null. Use \"checkin\" for "
-        "activity logs: set entries to a list with one item per distinct activity "
-        'described (e.g. "gym then emails" is two entries); for each entry always '
-        "include your single best-guess category from this list, even if unsure:\n"
+        "requested duration in hours if given, otherwise null. Set day_signal "
+        '"sick" only when the message explicitly says the person is unwell/sick '
+        'today, or "rest_day" only when it explicitly says today is an intentional '
+        "rest/recovery day — otherwise null; this is independent of intent and can "
+        "be set alongside any intent. Use \"checkin\" for activity logs: set entries "
+        "to a list with one item per distinct activity described (e.g. \"gym then "
+        'emails" is two entries); for each entry always include your single '
+        "best-guess category from this list, even if unsure:\n"
         f"{category_guide}\n"
-        'Set each entry\'s confidence to "low" only when the activity genuinely fits '
-        'multiple categories about equally well, or fits none of them well — not for '
-        'routine best-guesses; default to "high" whenever the fit is reasonably clear. '
-        'Use "correction" for fixing a previous entry, "query" for questions about '
-        'logged time, "settings" for category/target changes, and "other" for '
-        'anything else. For any intent other than "checkin", set entries to null. '
-        'Never use "Untracked" as a category — it is a system category applied only '
-        "to unlogged hours, never assigned from a reply."
+        "Also estimate each entry's duration_min from the text — use an explicit "
+        "duration if stated (\"2 hours\" → 120, \"30 min\" → 30), otherwise a "
+        'reasonable estimate for that kind of activity. Set each entry\'s confidence '
+        'to "low" only when the activity genuinely fits multiple categories about '
+        'equally well, or fits none of them well — not for routine best-guesses; '
+        'default to "high" whenever the fit is reasonably clear. Use "correction" '
+        'for fixing a previous entry, "query" for questions about logged time, '
+        '"settings" for category/target changes, and "other" for anything else. '
+        'For any intent other than "checkin", set entries to null. Never use '
+        '"Untracked" as a category — it is a system category applied only to '
+        "unlogged hours, never assigned from a reply."
     )
     return _classify_system_prompt_cache
 
 
-async def classify_intent(text: str) -> tuple[str, float | None, list[dict] | None]:
+async def classify_intent(
+    text: str,
+) -> tuple[str, float | None, list[dict] | None, str | None]:
     valid_categories = {c["name"] for c in get_categories() if c["name"] != "Untracked"}
     for attempt in range(2):
         try:
             response = await anthropic_client.messages.create(
                 model=HAIKU_MODEL,
-                max_tokens=400,
+                max_tokens=500,
                 system=get_classify_system_prompt(),
                 messages=[{"role": "user", "content": text}],
             )
-            raw = response.content[0].text
+            raw = extract_response_text(response)
             data = json.loads(raw[raw.index("{") : raw.rindex("}") + 1])
             intent = data.get("intent")
             if intent not in INTENTS:
                 raise ValueError(f"unknown intent: {intent!r}")
             pause_hours = data.get("pause_hours")
+            day_signal = data.get("day_signal")
+            if day_signal not in DAY_SIGNALS:
+                day_signal = None
 
             entries = None
             if intent == "checkin":
@@ -388,16 +563,25 @@ async def classify_intent(text: str) -> tuple[str, float | None, list[dict] | No
                         "low",
                     ):
                         continue
+                    try:
+                        duration_min = max(1, int(raw_entry.get("duration_min")))
+                    except (TypeError, ValueError):
+                        duration_min = 30
                     entries.append(
-                        {"activity": activity, "category": category, "confidence": confidence}
+                        {
+                            "activity": activity,
+                            "category": category,
+                            "confidence": confidence,
+                            "duration_min": duration_min,
+                        }
                     )
                 if not entries:
                     raise ValueError("checkin intent but no usable entries returned")
 
-            return intent, float(pause_hours) if pause_hours else None, entries
+            return intent, float(pause_hours) if pause_hours else None, entries, day_signal
         except Exception as exc:
             logger.warning("intent classification failed (attempt %d): %s", attempt + 1, exc)
-    return "other", None, None
+    return "other", None, None, None
 
 
 async def send_and_log(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
@@ -420,7 +604,8 @@ async def advance_pending_queue(context: ContextTypes.DEFAULT_TYPE) -> None:
     entry = get_next_unasked_entry()
     if entry is None:
         return
-    text = f"Where should '{entry['activity']}' go?"
+    duration = format_minutes(entry["duration_min"])
+    text = f"Where should '{entry['activity']}' ({duration}) go?"
     msg = await context.bot.send_message(
         chat_id=MY_CHAT_ID, text=text, reply_markup=build_category_keyboard(entry["id"])
     )
@@ -448,6 +633,197 @@ async def resolve_all_pending_with_guess(context: ContextTypes.DEFAULT_TYPE) -> 
     return len(pending)
 
 
+async def assess_intention_or_win(intention_text: str | None, entries: list[dict]) -> bool:
+    """One boolean FACT fed into decide_tier() — this judges accomplishment, not tier."""
+    if not entries:
+        return False
+    activity_lines = "\n".join(
+        f'- {e["activity"]} ({e["category"] or e["guessed_category"]}, '
+        f'{format_minutes(e["duration_min"])})'
+        for e in entries
+    )
+    prompt = (
+        f'Today\'s stated intention: {intention_text or "(none set)"}\n'
+        f"Today's logged activities:\n{activity_lines}\n\n"
+        "Did the day either (a) accomplish or make clear major progress on that "
+        "intention, or (b) contain some other clear major win, even without a stated "
+        'intention? Respond with JSON only: {"accomplished": true|false}.'
+    )
+    try:
+        response = await anthropic_client.messages.create(
+            model=HAIKU_MODEL,
+            max_tokens=50,
+            system=(
+                "You make a single yes/no judgment call about a day's productivity. "
+                "Respond with JSON only, no prose."
+            ),
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = extract_response_text(response)
+        data = json.loads(raw[raw.index("{") : raw.rindex("}") + 1])
+        return bool(data.get("accomplished"))
+    except Exception as exc:
+        logger.warning("intention assessment failed: %s", exc)
+        return False
+
+
+async def compose_summary_content(entries: list[dict], facts: dict, tier: int) -> dict:
+    """The tier (arg, already decided) is fixed; Claude only writes prose for it."""
+    label = VERDICT_TIER_LABELS[tier]
+    activity_lines = (
+        "\n".join(
+            f'- {e["activity"]} ({e["category"] or e["guessed_category"]}, '
+            f'{format_minutes(e["duration_min"])})'
+            for e in entries
+        )
+        or "(nothing logged)"
+    )
+
+    tier_instruction = {
+        1: (
+            "Verdict tone: warm, affirming praise for a day that hit the mark, 2-3 "
+            "sentences. If facts.rest_day is true, praise honoring rest as faithful "
+            "stewardship — do not mention deep work pace or hustle at all."
+        ),
+        2: (
+            "Verdict tone: name the ONE real gap plainly (pick the single most "
+            "relevant one from the facts — intention missed, deep work under pace, "
+            "or untracked time — do not list more than one), without shaming, then "
+            "state tomorrow's fix in a single sentence. 2-3 sentences total. If "
+            "facts.paused_used or facts.sick is true, skip gap-naming and just give "
+            "gentle encouragement forward instead."
+        ),
+        3: (
+            "Verdict tone: exactly 2 sentences — one sentence of plain truth about "
+            "today, one sentence of grace pointed at tomorrow. Direct but never "
+            "cruel, like a coach who believes in the person."
+        ),
+    }[tier]
+
+    prompt = (
+        f"Today's logged activities:\n{activity_lines}\n\n"
+        "Today's computed facts (already final — do not recompute, question, or "
+        f"second-guess any of them):\n{json.dumps(facts, indent=2, default=str)}\n\n"
+        f'The tier has ALREADY been decided by rules: tier {tier} ("{label}"). Do '
+        "not choose, mention, or imply a different tier.\n\n"
+        'Respond with JSON only: {"accomplishments": ["...", up to 3 short phrases, '
+        'most significant first, empty list if nothing notable], "observation": '
+        '"one short plain sentence noting a pattern or tradeoff in the day (empty '
+        'string if nothing notable)", "verdict": "the verdict body text only — do '
+        'NOT include the tier label itself, just the sentences that follow it"}.\n\n'
+        f"{tier_instruction}"
+    )
+
+    try:
+        response = await anthropic_client.messages.create(
+            model=SONNET_MODEL,
+            max_tokens=400,
+            system=(
+                "You write the daily summary for a personal time-tracking Telegram "
+                "bot, including a closing 'Steward's Verdict' inspired by the parable "
+                "of the talents (Matthew 25:14-30). Respond with JSON only, no prose "
+                "outside it."
+            ),
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = extract_response_text(response)
+        data = json.loads(raw[raw.index("{") : raw.rindex("}") + 1])
+        return {
+            "accomplishments": data.get("accomplishments") or [],
+            "observation": data.get("observation") or "",
+            "verdict": data.get("verdict") or "",
+        }
+    except Exception as exc:
+        logger.warning("summary composition failed: %s", exc)
+        return {"accomplishments": [], "observation": "", "verdict": ""}
+
+
+async def generate_and_send_daily_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
+    now = datetime.now(TZ)
+    date = now.date().isoformat()
+
+    await resolve_all_pending_with_guess(context)
+
+    entries = get_entries_for_date(date)
+    category_hours = compute_category_hours(entries)
+    tracked_hours = sum(category_hours.values())
+    waking_hours = compute_waking_hours(now)
+    untracked_hours = max(0.0, waking_hours - tracked_hours)
+    untracked_pct = (untracked_hours / waking_hours) if waking_hours > 0 else 0.0
+
+    deep_work_hours = category_hours.get("Deep Work", 0.0)
+    deep_work_weekly_target = get_category_weekly_target("Deep Work") or 0.0
+    deep_work_daily_target = deep_work_weekly_target / 7 if deep_work_weekly_target else 0.0
+
+    intention_text = get_intention(date)
+    day_meta = get_day_meta(date)
+    intention_or_win_met = await assess_intention_or_win(intention_text, entries)
+
+    facts = {
+        "date": date,
+        "tracked_hours": round(tracked_hours, 2),
+        "untracked_hours": round(untracked_hours, 2),
+        "untracked_pct": round(untracked_pct, 3),
+        "waking_hours": round(waking_hours, 2),
+        "deep_work_hours": round(deep_work_hours, 2),
+        "deep_work_daily_target": round(deep_work_daily_target, 2),
+        "category_hours": {k: round(v, 2) for k, v in category_hours.items()},
+        "intention_text": intention_text,
+        "intention_or_win_met": intention_or_win_met,
+        "paused_used": bool(day_meta["paused_used"]),
+        "sick": bool(day_meta["sick"]),
+        "rest_day": bool(day_meta["rest_day"]),
+    }
+
+    tier = decide_tier(facts)
+    content = await compose_summary_content(entries, facts, tier)
+
+    lines = [f"📊 Daily summary — {date}", ""]
+    lines.append(
+        f"Tracked: {format_hours(tracked_hours)} | Untracked: "
+        f"{format_hours(untracked_hours)} ({untracked_pct:.0%} of "
+        f"{format_hours(waking_hours)} awake)"
+    )
+    lines.append("")
+    lines.append(build_bar_chart(category_hours))
+
+    if content["accomplishments"]:
+        lines.append("")
+        lines.append("Wins:")
+        lines.extend(f"- {item}" for item in content["accomplishments"][:3])
+
+    if content["observation"]:
+        lines.append("")
+        lines.append(content["observation"])
+
+    guessed_entries = [e for e in entries if e["status"] == "guessed"]
+    if guessed_entries:
+        lines.append("")
+        lines.extend(
+            f'*"{e["activity"]}" → {e["category"]} (guessed category)' for e in guessed_entries
+        )
+
+    lines.append("")
+    lines.append(f"**{VERDICT_TIER_LABELS[tier]}**")
+    if content["verdict"]:
+        lines.append(content["verdict"])
+
+    await send_and_log(context, "\n".join(lines))
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO daily_summaries (date, payload_json, tier, sent_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(date) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                tier = excluded.tier,
+                sent_at = excluded.sent_at
+            """,
+            (date, json.dumps({**facts, **content}, default=str), tier, now.isoformat()),
+        )
+
+
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat is None or update.effective_chat.id != MY_CHAT_ID:
         return
@@ -456,7 +832,10 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log_message("inbound", text)
 
     row = get_state()
-    intent, pause_hours, entries = await classify_intent(text)
+    intent, pause_hours, entries, day_signal = await classify_intent(text)
+
+    if day_signal:
+        mark_day_flag(day_signal)
 
     if row["awaiting_intention"]:
         set_awaiting_intention(False)
@@ -466,14 +845,11 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
     if intent == "goodnight":
-        guessed_count = await resolve_all_pending_with_guess(context)
         set_state("ASLEEP")
-        msg = "Goodnight! Pings are paused until 6 AM."
-        if guessed_count:
-            plural = "entry" if guessed_count == 1 else "entries"
-            msg += f"\n({guessed_count} {plural} auto-guessed since you didn't confirm in time.)"
-        await send_and_log(context, msg)
+        await send_and_log(context, "Goodnight! Pings are paused until 6 AM.")
+        await generate_and_send_daily_summary(context)
     elif intent == "pause":
+        mark_day_flag("paused_used")
         if pause_hours:
             until = datetime.now(TZ) + timedelta(hours=pause_hours)
             set_paused_until(until)
@@ -488,11 +864,20 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         confirmed_lines = []
         any_new_pending = False
         for entry in entries:
+            duration = format_minutes(entry["duration_min"])
             if entry["confidence"] == "high":
-                create_entry(entry["activity"], entry["category"], "high", status="confirmed")
-                confirmed_lines.append(f'{entry["activity"]} → {entry["category"]} ✓')
+                create_entry(
+                    entry["activity"],
+                    entry["category"],
+                    entry["duration_min"],
+                    "high",
+                    status="confirmed",
+                )
+                confirmed_lines.append(f'{entry["activity"]} ({duration}) → {entry["category"]} ✓')
             else:
-                create_entry(entry["activity"], entry["category"], "low", status="pending")
+                create_entry(
+                    entry["activity"], entry["category"], entry["duration_min"], "low", status="pending"
+                )
                 any_new_pending = True
 
         if confirmed_lines:
@@ -535,7 +920,8 @@ async def handle_category_choice(update: Update, context: ContextTypes.DEFAULT_T
     resolve_entry(entry_id, category["name"], status="confirmed")
     append_category_note(category["name"], f'{entry["activity"]} → {category["name"]}')
 
-    confirmation = f'Logged: {entry["activity"]} → {category["name"]} ✓'
+    duration = format_minutes(entry["duration_min"])
+    confirmation = f'Logged: {entry["activity"]} ({duration}) → {category["name"]} ✓'
     await query.edit_message_text(confirmation)
     log_message("outbound", confirmation)
 
@@ -560,12 +946,8 @@ async def hourly_check_in(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def hard_stop(context: ContextTypes.DEFAULT_TYPE) -> None:
     row = get_state()
     if row["state"] == "AWAKE":
-        guessed_count = await resolve_all_pending_with_guess(context)
-        msg = "Logging off — here's your day. (Full summary coming soon.)"
-        if guessed_count:
-            plural = "entry" if guessed_count == 1 else "entries"
-            msg += f"\n({guessed_count} {plural} auto-guessed since you didn't confirm in time.)"
-        await send_and_log(context, msg)
+        await send_and_log(context, "Logging off — here's your day.")
+        await generate_and_send_daily_summary(context)
         set_state("ASLEEP")
 
 
