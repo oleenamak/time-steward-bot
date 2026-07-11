@@ -23,6 +23,10 @@ VAULT_DEPLOY_KEY = os.environ.get("VAULT_DEPLOY_KEY")
 
 # Pinned via `ssh-keyscan -t ed25519 github.com` — avoids StrictHostKeyChecking=no
 # (which would accept any host, i.e. no MITM protection) while needing no prompt.
+# Matching is by the name given on the command line (github.com), not the
+# HostName override below, so this stays correct even though we connect
+# elsewhere physically — see https://docs.github.com/en/authentication/
+# troubleshooting-ssh/using-ssh-over-the-https-port
 GITHUB_KNOWN_HOST = (
     "github.com ssh-ed25519 "
     "AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n"
@@ -75,9 +79,13 @@ def push_files(files: list[tuple[str, str]], commit_message: str) -> int:
 
         env = {
             **os.environ,
+            # Many cloud platforms (Railway included) block outbound port 22.
+            # GitHub's SSH service is also reachable over 443 for exactly this
+            # reason — tunnel through that instead of the default port.
             "GIT_SSH_COMMAND": (
                 f"ssh -i {key_path} -o UserKnownHostsFile={known_hosts_path} "
-                "-o IdentitiesOnly=yes"
+                "-o IdentitiesOnly=yes -o HostName=ssh.github.com -o Port=443 "
+                "-o HostKeyAlias=github.com -o ConnectTimeout=10"
             ),
         }
 
