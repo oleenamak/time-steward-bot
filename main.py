@@ -22,16 +22,22 @@ A personal Telegram bot that:
   the parable of the talents, with Claude only writing the prose for the
   tier it's given. The tier is stored with the summary for future weekly
   rollups.
+- Right after the daily summary, renders the day (hourly table + summary +
+  verdict) as markdown and pushes it to a private GitHub vault repo over a
+  deploy key (see vault.py). `python main.py backfill-vault` does the same
+  for every day that already has a stored summary, one-time.
 
 Runs via long polling — no webhook, no public URL needed.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import sqlite3
+import sys
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -45,6 +51,8 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+import vault
 
 load_dotenv()
 
@@ -163,6 +171,7 @@ def init_db() -> None:
                 category TEXT,
                 guessed_category TEXT NOT NULL,
                 duration_min INTEGER NOT NULL,
+                is_accomplishment INTEGER NOT NULL DEFAULT 0,
                 confidence TEXT NOT NULL CHECK (confidence IN ('high', 'low')),
                 status TEXT NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'confirmed', 'guessed')),
@@ -386,7 +395,12 @@ def append_category_note(category_name: str, note: str, max_lines: int = 10) -> 
 
 
 def create_entry(
-    activity: str, guessed_category: str, duration_min: int, confidence: str, status: str
+    activity: str,
+    guessed_category: str,
+    duration_min: int,
+    confidence: str,
+    status: str,
+    is_accomplishment: bool = False,
 ) -> int:
     today = datetime.now(TZ).date().isoformat()
     now = datetime.now(TZ).isoformat()
@@ -395,9 +409,9 @@ def create_entry(
         cur = conn.execute(
             """
             INSERT INTO entries
-                (date, activity, category, guessed_category, duration_min, confidence, status,
-                 created_at, resolved_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (date, activity, category, guessed_category, duration_min, is_accomplishment,
+                 confidence, status, created_at, resolved_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 today,
@@ -405,6 +419,7 @@ def create_entry(
                 category,
                 guessed_category,
                 duration_min,
+                int(is_accomplishment),
                 confidence,
                 status,
                 now,
@@ -501,7 +516,8 @@ def get_classify_system_prompt() -> str:
         '"day_signal": "sick"|"rest_day"|null, '
         '"entries": [{"activity": "<short activity phrase>", '
         '"category": "<category name>", "confidence": "high|low", '
-        '"duration_min": <integer minutes>}] or null}. '
+        '"duration_min": <integer minutes>, "is_accomplishment": true|false}] '
+        "or null}. "
         'Use "goodnight" for sleep signals like "good night", "gn", "going to bed", '
         '"done for the day". Use "pause" when the user wants pings suppressed '
         '(e.g. "pause 2 hours", "skip today", "traveling") — set pause_hours to the '
@@ -516,15 +532,18 @@ def get_classify_system_prompt() -> str:
         f"{category_guide}\n"
         "Also estimate each entry's duration_min from the text — use an explicit "
         "duration if stated (\"2 hours\" → 120, \"30 min\" → 30), otherwise a "
-        'reasonable estimate for that kind of activity. Set each entry\'s confidence '
-        'to "low" only when the activity genuinely fits multiple categories about '
-        'equally well, or fits none of them well — not for routine best-guesses; '
-        'default to "high" whenever the fit is reasonably clear. Use "correction" '
-        'for fixing a previous entry, "query" for questions about logged time, '
-        '"settings" for category/target changes, and "other" for anything else. '
-        'For any intent other than "checkin", set entries to null. Never use '
-        '"Untracked" as a category — it is a system category applied only to '
-        "unlogged hours, never assigned from a reply."
+        'reasonable estimate for that kind of activity. Set is_accomplishment to '
+        "true only for a genuinely notable win worth highlighting later (shipped "
+        "something, hit a real milestone) — most entries are routine and should be "
+        'false. Set each entry\'s confidence to "low" only when the activity '
+        'genuinely fits multiple categories about equally well, or fits none of '
+        'them well — not for routine best-guesses; default to "high" whenever the '
+        'fit is reasonably clear. Use "correction" for fixing a previous entry, '
+        '"query" for questions about logged time, "settings" for category/target '
+        'changes, and "other" for anything else. For any intent other than '
+        '"checkin", set entries to null. Never use "Untracked" as a category — it '
+        "is a system category applied only to unlogged hours, never assigned from "
+        "a reply."
     )
     return _classify_system_prompt_cache
 
@@ -573,6 +592,7 @@ async def classify_intent(
                             "category": category,
                             "confidence": confidence,
                             "duration_min": duration_min,
+                            "is_accomplishment": bool(raw_entry.get("is_accomplishment")),
                         }
                     )
                 if not entries:
@@ -823,6 +843,76 @@ async def generate_and_send_daily_summary(context: ContextTypes.DEFAULT_TYPE) ->
             (date, json.dumps({**facts, **content}, default=str), tier, now.isoformat()),
         )
 
+    if vault.is_configured():
+        try:
+            await export_day_to_vault(date)
+        except Exception as exc:
+            logger.warning("vault export failed for %s: %s", date, exc)
+            await send_and_log(context, f"(Vault sync failed for {date} — will retry next time.)")
+    else:
+        logger.info("vault export skipped for %s: VAULT_* env vars not set", date)
+
+
+def render_day_markdown(date: str) -> str:
+    entries = get_entries_for_date(date)
+    intention_text = get_intention(date)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        summary_row = conn.execute(
+            "SELECT payload_json, tier FROM daily_summaries WHERE date = ?", (date,)
+        ).fetchone()
+
+    lines = [f"# {date}", "", f"**Intention:** {intention_text or '_none set_'}", ""]
+    lines.append("| Hour | What I did | Category | Min | Win |")
+    lines.append("|------|------------|----------|-----|-----|")
+    for e in entries:
+        hour = datetime.fromisoformat(e["created_at"]).strftime("%-I:%M %p")
+        category = e["category"] or e["guessed_category"]
+        win = "✓" if e["is_accomplishment"] else ""
+        activity = e["activity"].replace("|", "\\|")
+        lines.append(f"| {hour} | {activity} | {category} | {e['duration_min']} | {win} |")
+
+    lines.append("")
+    lines.append("## Summary")
+    lines.append("")
+
+    if summary_row is None:
+        lines.append("_No summary generated for this day._")
+    else:
+        payload = json.loads(summary_row["payload_json"])
+        tier = summary_row["tier"]
+        lines.append(
+            f"Tracked: {format_hours(payload['tracked_hours'])} | Untracked: "
+            f"{format_hours(payload['untracked_hours'])} "
+            f"({payload['untracked_pct']:.0%} of {format_hours(payload['waking_hours'])} awake)"
+        )
+        lines.append("")
+        lines.append(build_bar_chart(payload.get("category_hours", {})))
+        if payload.get("accomplishments"):
+            lines.append("")
+            lines.append("**Wins:**")
+            lines.extend(f"- {item}" for item in payload["accomplishments"][:3])
+        if payload.get("observation"):
+            lines.append("")
+            lines.append(payload["observation"])
+        lines.append("")
+        lines.append(f"**{VERDICT_TIER_LABELS[tier]}**")
+        if payload.get("verdict"):
+            lines.append(payload["verdict"])
+
+    return "\n".join(lines) + "\n"
+
+
+async def export_day_to_vault(date: str) -> None:
+    """Raises on failure (unconfigured, git/ssh error, etc.) — callers decide
+    whether to swallow it (nightly path) or surface it (backfill path)."""
+    if not vault.is_configured():
+        raise RuntimeError("VAULT_REPO_SSH_URL / VAULT_DEPLOY_KEY not set")
+    markdown = render_day_markdown(date)
+    relative_path = f"Time Steward/Logs/{date}.md"
+    await asyncio.to_thread(vault.push_file, relative_path, markdown, f"Log for {date}")
+
 
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat is None or update.effective_chat.id != MY_CHAT_ID:
@@ -872,11 +962,17 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     entry["duration_min"],
                     "high",
                     status="confirmed",
+                    is_accomplishment=entry["is_accomplishment"],
                 )
                 confirmed_lines.append(f'{entry["activity"]} ({duration}) → {entry["category"]} ✓')
             else:
                 create_entry(
-                    entry["activity"], entry["category"], entry["duration_min"], "low", status="pending"
+                    entry["activity"],
+                    entry["category"],
+                    entry["duration_min"],
+                    "low",
+                    status="pending",
+                    is_accomplishment=entry["is_accomplishment"],
                 )
                 any_new_pending = True
 
@@ -975,7 +1071,33 @@ def schedule_jobs(app: Application) -> None:
     )
 
 
+async def backfill_vault() -> None:
+    """One-time: export every day that already has a stored daily summary.
+    Days with logged entries but no summary (e.g. the bot never reached
+    goodnight/hard-stop that day) are skipped — there's nothing finished to
+    export for them."""
+    with sqlite3.connect(DB_PATH) as conn:
+        dates = [r[0] for r in conn.execute("SELECT date FROM daily_summaries ORDER BY date")]
+
+    if not dates:
+        print("No daily summaries found — nothing to backfill.")
+        return
+
+    print(f"Backfilling {len(dates)} day(s) to the vault...")
+    for date in dates:
+        try:
+            await export_day_to_vault(date)
+            print(f"  OK    {date}")
+        except Exception as exc:
+            print(f"  FAIL  {date}: {exc}")
+
+
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "backfill-vault":
+        init_db()
+        asyncio.run(backfill_vault())
+        return
+
     init_db()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
